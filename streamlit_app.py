@@ -1,592 +1,666 @@
+import asyncio
+import ccxt
+from ccxt.base.errors import NetworkError, DDoSProtection, RateLimitExceeded
+from collections import deque
+from datetime import datetime
+import logging
+from typing import Optional, Dict, Any
+import sys
+import ssl
+import certifi
 
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-import numpy as np
-from io import BytesIO
-import openpyxl
-
-# ==================== KONFIGURASI HALAMAN ====================
-st.set_page_config(
-    page_title="RAB Dinamis Kelapa Sawit - 25 Tahun",
-    page_icon="🌴",
-    layout="wide",
-    initial_sidebar_state="expanded"
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
 )
+logger = logging.getLogger(__name__)
 
-# ==================== CUSTOM CSS (DARK MODE PROFESSIONAL) ====================
-st.markdown("""
-<style>
-    .main {
-        background-color: #0e1117;
-    }
-    .stMetric {
-        background-color: #1e2530;
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid #2e3a4a;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-        padding: 20px;
-        border-radius: 12px;
-        color: white;
-        text-align: center;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-    }
-    .metric-value {
-        font-size: 32px;
-        font-weight: bold;
-        margin: 10px 0;
-    }
-    .metric-label {
-        font-size: 14px;
-        opacity: 0.9;
-    }
-    h1 {
-        color: #4CAF50;
-        text-align: center;
-        padding: 20px 0;
-    }
-    .section-header {
-        background: linear-gradient(90deg, #2e7d32 0%, #4CAF50 100%);
-        padding: 10px 20px;
-        border-radius: 8px;
-        color: white;
-        font-weight: bold;
-        margin: 20px 0 10px 0;
-    }
-</style>
-""", unsafe_allow_html=True)
 
-# ==================== FUNGSI HELPER ====================
-
-def get_yield_curve(year, luas_lahan):
+class OrderflowScalpingBot:
     """
-    Kurva produksi kelapa sawit berdasarkan umur tanaman
-    Return: Ton TBS per tahun
+    High-Frequency Orderflow Imbalance Scalping Bot
+    Menggunakan Aggressive Liquidity Detection untuk Binance Futures
     """
-    if year <= 3:
-        return 0  # TBM
-    elif year == 4:
-        return 12 * luas_lahan
-    elif year == 5:
-        return 15 * luas_lahan
-    elif year == 6:
-        return 18 * luas_lahan
-    elif year == 7:
-        return 22 * luas_lahan
-    elif 8 <= year <= 15:
-        return 26.5 * luas_lahan  # Masa puncak (rata-rata 25-28)
-    elif 16 <= year <= 19:
-        return 23 * luas_lahan  # Rata-rata 22-24
-    elif 20 <= year <= 25:
-        return 19 * luas_lahan  # Penurunan (rata-rata 18-20)
-    else:
-        return 15 * luas_lahan
-
-
-def format_currency(value):
-    """Format angka ke Rupiah"""
-    return f"Rp {value:,.0f}".replace(",", ".")
-
-def create_default_capex():
-    """Data default CAPEX (Tahun 0) - Update April 2026"""
-    return pd.DataFrame({
-        'Item': [
-            'Land Clearing & Persiapan Lahan',
-            'Bibit Kelapa Sawit (Bersertifikat)',
-            'Penanaman & Tenaga Kerja',
-            'Pupuk Dasar (NPK, Dolomit)',
-            'Alat Kerja (Cangkul, Sprayer, dll)',
-            'Infrastruktur Dasar (Jalan, Parit)'
-        ],
-        'Satuan': ['Ha', 'Pokok', 'Ha', 'Ha', 'Set', 'Ha'],
-        'Harga Satuan (Rp)': [8500000, 45000, 3500000, 4200000, 2500000, 6000000],
-        'Volume': [1, 136, 1, 1, 1, 1],
-        'Subtotal (Rp)': [0, 0, 0, 0, 0, 0]
-    })
-
-def create_default_opex_tbm():
-    """Data default OPEX TBM (Per Tahun) - Update April 2026"""
-    return pd.DataFrame({
-        'Item': [
-            'Pupuk Urea',
-            'Pupuk NPK',
-            'Pupuk Dolomit',
-            'Herbisida (Roundup)',
-            'Insektisida',
-            'Upah Pemupukan',
-            'Upah Penyemprotan',
-            'Upah Pemeliharaan Umum'
-        ],
-        'Satuan': ['Kg', 'Kg', 'Kg', 'Liter', 'Liter', 'HOK', 'HOK', 'HOK'],
-        'Harga Satuan (Rp)': [11000, 14500, 8500, 85000, 120000, 100000, 100000, 100000],
-        'Volume/Ha': [250, 300, 200, 8, 4, 12, 8, 15],
-        'Subtotal (Rp)': [0, 0, 0, 0, 0, 0, 0, 0]
-    })
-
-def create_default_opex_tm():
-    """Data default OPEX TM (Per Tahun) - Update April 2026"""
-    return pd.DataFrame({
-        'Item': [
-            'Pupuk Urea',
-            'Pupuk NPK',
-            'Pupuk KCl',
-            'Pupuk Dolomit',
-            'Herbisida',
-            'Upah Panen (per Kg TBS)',
-            'Upah Langsir TBS',
-            'Transport ke PKS',
-            'Pemeliharaan Jalan & Parit',
-            'Upah Pemupukan'
-        ],
-        'Satuan': ['Kg', 'Kg', 'Kg', 'Kg', 'Liter', 'Kg', 'Ton', 'Ton', 'Ha', 'HOK'],
-        'Harga Satuan (Rp)': [11000, 14500, 13000, 8500, 85000, 300, 50000, 150000, 500000, 100000],
-        'Volume/Ha': [400, 500, 300, 250, 10, 0, 0, 0, 1, 18],
-        'Subtotal (Rp)': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    })
-
-# ==================== SIDEBAR INPUT ====================
-st.sidebar.image("https://img.icons8.com/color/96/000000/palm-tree.png", width=80)
-st.sidebar.title("⚙️ Konfigurasi Global")
-
-luas_lahan = st.sidebar.number_input(
-    "🌾 Luas Lahan (Ha)", 
-    min_value=1.0, 
-    max_value=10000.0, 
-    value=10.0, 
-    step=1.0
-)
-
-pokok_per_ha = st.sidebar.number_input(
-    "🌱 Jumlah Pokok per Ha", 
-    min_value=100, 
-    max_value=200, 
-    value=136, 
-    step=1
-)
-
-durasi_tbm = st.sidebar.number_input(
-    "⏳ Durasi TBM (Tahun)", 
-    min_value=2, 
-    max_value=5, 
-    value=3, 
-    step=1
-)
-
-total_tahun = st.sidebar.number_input(
-    "📅 Total Siklus Investasi (Tahun)", 
-    min_value=10, 
-    max_value=30, 
-    value=25, 
-    step=1
-)
-
-harga_tbs = st.sidebar.number_input(
-    "💰 Harga TBS Saat Ini (Rp/Kg)", 
-    min_value=1000, 
-    max_value=5000, 
-    value=2100, 
-    step=50
-)
-
-st.sidebar.markdown("---")
-st.sidebar.info(f"""
-**📊 Ringkasan Input:**
-- Total Pokok: **{int(luas_lahan * pokok_per_ha):,}** pokok
-- Fase TBM: Tahun 0-{durasi_tbm}
-- Fase TM: Tahun {durasi_tbm+1}-{total_tahun}
-""")
-
-# ==================== HEADER UTAMA ====================
-st.markdown("<h1>🌴 SISTEM RAB DINAMIS & PROYEKSI PROFITABILITAS KELAPA SAWIT</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align: center; color: #888;'>Analisis Investasi Jangka Panjang (25 Tahun) | Update Data Pasar April 2026</p>", unsafe_allow_html=True)
-
-# ==================== TAB NAVIGATION ====================
-tab1, tab2, tab3, tab4 = st.tabs(["📋 RAB CAPEX", "🌱 RAB OPEX TBM", "🌴 RAB OPEX TM", "📈 PROYEKSI & ANALISIS"])
-
-# ==================== TAB 1: CAPEX ====================
-with tab1:
-    st.markdown("<div class='section-header'>💼 CAPITAL EXPENDITURE (CAPEX) - TAHUN 0</div>", unsafe_allow_html=True)
     
-    if 'df_capex' not in st.session_state:
-        st.session_state.df_capex = create_default_capex()
-    
-    # Update volume bibit otomatis
-    st.session_state.df_capex.loc[1, 'Volume'] = int(luas_lahan * pokok_per_ha)
-    
-    # Update volume lainnya
-    for idx in [0, 2, 3, 5]:
-        st.session_state.df_capex.loc[idx, 'Volume'] = luas_lahan
-    
-    # Hitung subtotal
-    st.session_state.df_capex['Subtotal (Rp)'] = (
-        st.session_state.df_capex['Harga Satuan (Rp)'] * 
-        st.session_state.df_capex['Volume']
-    )
-    
-    edited_capex = st.data_editor(
-        st.session_state.df_capex,
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "Harga Satuan (Rp)": st.column_config.NumberColumn(
-                "Harga Satuan (Rp)",
-                format="Rp %.0f"
-            ),
-            "Subtotal (Rp)": st.column_config.NumberColumn(
-                "Subtotal (Rp)",
-                format="Rp %.0f",
-                disabled=True
-            )
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        symbol: str = 'BTC/USDT:USDT',
+        demo_mode: bool = True
+    ):
+        """
+        Inisialisasi bot dengan konfigurasi awal
+        
+        Args:
+            api_key: Binance API Key
+            api_secret: Binance API Secret
+            symbol: Trading pair (format CCXT)
+            demo_mode: Gunakan demo trading mode
+        """
+        self.symbol = symbol
+        self.demo_mode = demo_mode
+        
+        # Inisialisasi exchange dengan konfigurasi yang benar
+        exchange_config = {
+            'apiKey': api_key,
+            'secret': api_secret,
+            'enableRateLimit': True,
+            'timeout': 30000,
+            'options': {
+                'defaultType': 'future',
+                'adjustForTimeDifference': True,
+                'warnOnFetchOpenOrdersWithoutSymbol': False,
+                'recvWindow': 60000,
+            }
         }
-    )
+        
+        # Jika demo mode, override semua URL ke demo server
+        if self.demo_mode:
+            demo_base = 'https://testnet.binancefuture.com'
+            exchange_config['urls'] = {
+                'logo': 'https://user-images.githubusercontent.com/1294454/117738721-668c8d80-b205-11eb-8c49-3fad84c4a07f.jpg',
+                'api': {
+                    'web': demo_base,
+                    'fapiPublic': demo_base + '/fapi/v1',
+                    'fapiPrivate': demo_base + '/fapi/v1',
+                    'fapiPrivateV2': demo_base + '/fapi/v2',
+                    'fapiPrivateV3': demo_base + '/fapi/v3',
+                    'fapiData': demo_base + '/futures/data',
+                    'public': demo_base + '/fapi/v1',
+                    'private': demo_base + '/fapi/v1',
+                    'v1': demo_base + '/fapi/v1',
+                    'v2': demo_base + '/fapi/v2',
+                    'v3': demo_base + '/fapi/v3',
+                },
+                'test': {
+                    'fapiPublic': demo_base + '/fapi/v1',
+                    'fapiPrivate': demo_base + '/fapi/v1',
+                },
+                'doc': [
+                    'https://binance-docs.github.io/apidocs/futures/en/',
+                ],
+            }
+            
+            logger.info("🔧 Demo Trading Mode AKTIF (Binance Futures Testnet)")
+            logger.info(f"📡 REST API: {demo_base}")
+            logger.info("🌐 WebSocket: wss://stream.binancefuture.com")
+        
+        self.exchange = ccxt.binanceusdm(exchange_config)
+        
+        # Buffer untuk orderflow data (sliding window)
+        self.trades_buffer = deque(maxlen=500)
+        
+        # Parameter Risk Management
+        self.risk_idr = 100000  # Rp 25.000
+        self.usd_idr_rate = 16000  # Kurs IDR ke USD
+        self.risk_usd = self.risk_idr / self.usd_idr_rate  # ~$1.56
+        self.stop_loss_pct = 0.01  # 1% stop loss awal
+        self.trailing_stop_pct = 0.02  # 2% trailing stop
+        
+        # Parameter Orderflow Imbalance
+        self.imbalance_threshold = 1.8  # Pengali threshold
+        
+        # State Management
+        self.position: Optional[Dict[str, Any]] = None
+        self.highest_price: Optional[float] = None
+        self.lowest_price: Optional[float] = None
+        self.current_stop_loss: Optional[float] = None
+        
+        # Market Info
+        self.market_info: Optional[Dict] = None
+        
+        # Trade tracking untuk deduplikasi
+        self.last_trade_id = None
+        
+    async def initialize(self):
+        """Load market info dan validasi koneksi"""
+        try:
+            logger.info("🔄 Loading market information...")
+            
+            # Load markets tanpa fetch currencies (skip SSL issue)
+            try:
+                # Load markets dengan skip currencies
+                self.exchange.options['fetchCurrencies'] = False
+                markets = self.exchange.load_markets()
+                self.market_info = self.exchange.market(self.symbol)
+                
+                logger.info(f"✅ Market loaded: {self.symbol}")
+                logger.info(f"📊 Precision - Amount: {self.market_info['precision']['amount']}, Price: {self.market_info['precision']['price']}")
+            except Exception as e:
+                logger.warning(f"⚠️ Error loading full market info: {e}")
+                # Fallback: set manual market info
+                self.market_info = {
+                    'id': 'BTCUSDT',
+                    'symbol': self.symbol,
+                    'precision': {
+                        'amount': 3,
+                        'price': 2,
+                    },
+                    'limits': {
+                        'amount': {'min': 0.001},
+                        'price': {'min': 0.01},
+                    }
+                }
+                logger.info("✅ Using fallback market info")
+            
+            # Validasi balance (optional, bisa skip jika error)
+            try:
+                balance = self.exchange.fetch_balance()
+                usdt_balance = balance['USDT']['free']
+                logger.info(f"💰 USDT Balance: ${usdt_balance:.2f}")
+                
+                if usdt_balance < self.risk_usd:
+                    logger.warning(f"⚠️ Balance rendah! Minimal ${self.risk_usd:.2f}")
+                    logger.info("💡 Untuk mendapatkan testnet USDT, gunakan faucet di https://testnet.binancefuture.com")
+            except Exception as e:
+                logger.warning(f"⚠️ Tidak bisa fetch balance: {e}")
+                logger.info("💡 Bot akan tetap berjalan untuk monitoring orderflow")
+            
+            logger.info(f"✅ Inisialisasi berhasil untuk {self.symbol}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error saat inisialisasi: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
-    st.session_state.df_capex = edited_capex
-    total_capex = edited_capex['Subtotal (Rp)'].sum()
-    
-    col1, col2 = st.columns([3, 1])
-    with col2:
-        st.markdown(f"""
-        <div class='metric-card'>
-            <div class='metric-label'>TOTAL CAPEX</div>
-            <div class='metric-value'>{format_currency(total_capex)}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-# ==================== TAB 2: OPEX TBM ====================
-with tab2:
-    st.markdown("<div class='section-header'>🌱 OPERATIONAL EXPENDITURE TBM (Per Tahun)</div>", unsafe_allow_html=True)
-    st.info(f"💡 Biaya ini akan diulang selama **{durasi_tbm} tahun** fase TBM (Tanaman Belum Menghasilkan)")
-    
-    if 'df_opex_tbm' not in st.session_state:
-        st.session_state.df_opex_tbm = create_default_opex_tbm()
-    
-    # Hitung subtotal
-    st.session_state.df_opex_tbm['Subtotal (Rp)'] = (
-        st.session_state.df_opex_tbm['Harga Satuan (Rp)'] * 
-        st.session_state.df_opex_tbm['Volume/Ha'] * 
-        luas_lahan
-    )
-    
-    edited_opex_tbm = st.data_editor(
-        st.session_state.df_opex_tbm,
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "Harga Satuan (Rp)": st.column_config.NumberColumn(
-                "Harga Satuan (Rp)",
-                format="Rp %.0f"
-            ),
-            "Subtotal (Rp)": st.column_config.NumberColumn(
-                "Subtotal (Rp)",
-                format="Rp %.0f",
-                disabled=True
-            )
+    def calculate_orderflow_imbalance(self) -> Dict[str, float]:
+        """
+        Kalkulasi Volume Delta dari orderflow
+        
+        Returns:
+            Dict dengan V_buy, V_sell, dan ratio
+        """
+        v_buy = 0.0
+        v_sell = 0.0
+        
+        for trade in self.trades_buffer:
+            amount = trade['amount']
+            side = trade['side']
+            
+            if side == 'buy':  # Aggressor hit ASK (bullish)
+                v_buy += amount
+            elif side == 'sell':  # Aggressor hit BID (bearish)
+                v_sell += amount
+        
+        # Hindari division by zero
+        ratio_buy = v_buy / v_sell if v_sell > 0 else 0
+        ratio_sell = v_sell / v_buy if v_buy > 0 else 0
+        
+        return {
+            'v_buy': v_buy,
+            'v_sell': v_sell,
+            'ratio_buy': ratio_buy,
+            'ratio_sell': ratio_sell
         }
-    )
     
-    st.session_state.df_opex_tbm = edited_opex_tbm
-    total_opex_tbm_per_tahun = edited_opex_tbm['Subtotal (Rp)'].sum()
-    total_opex_tbm_all = total_opex_tbm_per_tahun * durasi_tbm
+    def calculate_position_size(self, entry_price: float) -> float:
+        """
+        Hitung ukuran posisi berdasarkan risk management
+        
+        Args:
+            entry_price: Harga entry
+            
+        Returns:
+            Amount dalam satuan koin (precision-adjusted)
+        """
+        # Risk per trade: $1.56
+        # Stop loss: 1% dari entry
+        stop_distance = entry_price * self.stop_loss_pct
+        
+        # Position size = Risk / Stop Distance
+        raw_amount = self.risk_usd / stop_distance
+        
+        # Adjust precision sesuai aturan exchange
+        amount = self.exchange.amount_to_precision(self.symbol, raw_amount)
+        
+        return float(amount)
     
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown(f"""
-        <div class='metric-card'>
-            <div class='metric-label'>OPEX TBM Per Tahun</div>
-            <div class='metric-value'>{format_currency(total_opex_tbm_per_tahun)}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col2:
-        st.markdown(f"""
-        <div class='metric-card'>
-            <div class='metric-label'>Total OPEX TBM ({durasi_tbm} Tahun)</div>
-            <div class='metric-value'>{format_currency(total_opex_tbm_all)}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-# ==================== TAB 3: OPEX TM ====================
-with tab3:
-    st.markdown("<div class='section-header'>🌴 OPERATIONAL EXPENDITURE TM (Per Tahun)</div>", unsafe_allow_html=True)
-    st.info(f"💡 Biaya ini akan diulang selama **{total_tahun - durasi_tbm} tahun** fase TM (Tanaman Menghasilkan)")
-    
-    if 'df_opex_tm' not in st.session_state:
-        st.session_state.df_opex_tm = create_default_opex_tm()
-    
-    # Hitung subtotal (untuk item non-panen)
-    for idx in range(len(st.session_state.df_opex_tm)):
-        if st.session_state.df_opex_tm.loc[idx, 'Item'] not in ['Upah Panen (per Kg TBS)', 'Upah Langsir TBS', 'Transport ke PKS']:
-            st.session_state.df_opex_tm.loc[idx, 'Subtotal (Rp)'] = (
-                st.session_state.df_opex_tm.loc[idx, 'Harga Satuan (Rp)'] * 
-                st.session_state.df_opex_tm.loc[idx, 'Volume/Ha'] * 
-                luas_lahan
+    async def execute_market_order(
+        self,
+        side: str,
+        amount: float,
+        reduce_only: bool = False
+    ) -> Optional[Dict]:
+        """
+        Eksekusi market order dengan error handling
+        
+        Args:
+            side: 'buy' atau 'sell'
+            amount: Jumlah koin
+            reduce_only: True jika closing position
+            
+        Returns:
+            Order result atau None jika gagal
+        """
+        try:
+            params = {}
+            if reduce_only:
+                params['reduceOnly'] = True
+            
+            order = self.exchange.create_order(
+                symbol=self.symbol,
+                type='market',
+                side=side,
+                amount=amount,
+                params=params
             )
+            
+            logger.info(f"✅ Market Order Executed: {side.upper()} {amount} @ Market")
+            return order
+            
+        except Exception as e:
+            logger.error(f"❌ Error executing market order: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
-    edited_opex_tm = st.data_editor(
-        st.session_state.df_opex_tm,
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "Harga Satuan (Rp)": st.column_config.NumberColumn(
-                "Harga Satuan (Rp)",
-                format="Rp %.0f"
-            ),
-            "Subtotal (Rp)": st.column_config.NumberColumn(
-                "Subtotal (Rp)",
-                format="Rp %.0f",
-                disabled=True
+    async def place_stop_loss(
+        self,
+        side: str,
+        amount: float,
+        stop_price: float
+    ) -> Optional[Dict]:
+        """
+        Place stop loss order (stop market)
+        
+        Args:
+            side: 'buy' (untuk close short) atau 'sell' (untuk close long)
+            amount: Jumlah koin
+            stop_price: Trigger price
+            
+        Returns:
+            Order result atau None
+        """
+        try:
+            # Adjust precision
+            stop_price = float(self.exchange.price_to_precision(self.symbol, stop_price))
+            
+            order = self.exchange.create_order(
+                symbol=self.symbol,
+                type='STOP_MARKET',
+                side=side,
+                amount=amount,
+                params={
+                    'stopPrice': stop_price,
+                    'reduceOnly': True
+                }
             )
-        }
-    )
+            
+            logger.info(f"🛡️ Stop Loss Placed: {side.upper()} @ ${stop_price:.2f}")
+            return order
+            
+        except Exception as e:
+            logger.error(f"❌ Error placing stop loss: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
-    st.session_state.df_opex_tm = edited_opex_tm
+    async def open_long_position(self, entry_price: float):
+        """Buka posisi LONG dengan stop loss"""
+        amount = self.calculate_position_size(entry_price)
+        
+        logger.info(f"🔄 Opening LONG position: {amount} BTC @ ${entry_price:.2f}")
+        
+        # Execute market buy
+        order = await self.execute_market_order('buy', amount)
+        
+        if order:
+            # Set initial stop loss (1% below entry)
+            initial_stop = entry_price * (1 - self.stop_loss_pct)
+            await self.place_stop_loss('sell', amount, initial_stop)
+            
+            self.position = {
+                'side': 'long',
+                'entry_price': entry_price,
+                'amount': amount,
+                'timestamp': datetime.now()
+            }
+            self.highest_price = entry_price
+            self.current_stop_loss = initial_stop
+            
+            logger.info(f"🟢 LONG Position Opened: {amount} @ ${entry_price:.2f}")
+            logger.info(f"🛡️ Initial Stop Loss: ${initial_stop:.2f}")
     
-    st.warning("⚠️ Biaya Panen, Langsir, dan Transport akan dihitung otomatis berdasarkan produksi aktual per tahun")
+    async def open_short_position(self, entry_price: float):
+        """Buka posisi SHORT dengan stop loss"""
+        amount = self.calculate_position_size(entry_price)
+        
+        logger.info(f"🔄 Opening SHORT position: {amount} BTC @ ${entry_price:.2f}")
+        
+        # Execute market sell
+        order = await self.execute_market_order('sell', amount)
+        
+        if order:
+            # Set initial stop loss (1% above entry)
+            initial_stop = entry_price * (1 + self.stop_loss_pct)
+            await self.place_stop_loss('buy', amount, initial_stop)
+            
+            self.position = {
+                'side': 'short',
+                'entry_price': entry_price,
+                'amount': amount,
+                'timestamp': datetime.now()
+            }
+            self.lowest_price = entry_price
+            self.current_stop_loss = initial_stop
+            
+            logger.info(f"🔴 SHORT Position Opened: {amount} @ ${entry_price:.2f}")
+            logger.info(f"🛡️ Initial Stop Loss: ${initial_stop:.2f}")
+    
+    async def close_position(self, reason: str = "Manual"):
+        """Close posisi aktif"""
+        if not self.position:
+            return
+        
+        side = 'sell' if self.position['side'] == 'long' else 'buy'
+        amount = self.position['amount']
+        
+        logger.info(f"🔄 Closing position: {self.position['side'].upper()} - Reason: {reason}")
+        
+        order = await self.execute_market_order(side, amount, reduce_only=True)
+        
+        if order:
+            logger.info(f"🔒 Position Closed: {reason}")
+            self.position = None
+            self.highest_price = None
+            self.lowest_price = None
+            self.current_stop_loss = None
+    
+    async def update_trailing_stop(self, current_price: float):
+        """
+        Update trailing stop berdasarkan pergerakan harga
+        
+        Args:
+            current_price: Harga real-time saat ini
+        """
+        if not self.position:
+            return
+        
+        if self.position['side'] == 'long':
+            # Update highest price
+            if current_price > self.highest_price:
+                self.highest_price = current_price
+                new_stop = current_price * (1 - self.trailing_stop_pct)
+                
+                # Hanya update jika stop naik (trailing up)
+                if new_stop > self.current_stop_loss:
+                    self.current_stop_loss = new_stop
+                    logger.info(f"📈 Trailing Stop Updated (LONG): ${new_stop:.2f} | Highest: ${self.highest_price:.2f}")
+            
+            # Check jika harga menyentuh trailing stop
+            if current_price <= self.current_stop_loss:
+                logger.info(f"🎯 Trailing Stop Hit! Closing LONG at ${current_price:.2f}")
+                await self.close_position("Trailing Stop Hit")
+        
+        elif self.position['side'] == 'short':
+            # Update lowest price
+            if current_price < self.lowest_price:
+                self.lowest_price = current_price
+                new_stop = current_price * (1 + self.trailing_stop_pct)
+                
+                # Hanya update jika stop turun (trailing down)
+                if new_stop < self.current_stop_loss:
+                    self.current_stop_loss = new_stop
+                    logger.info(f"📉 Trailing Stop Updated (SHORT): ${new_stop:.2f} | Lowest: ${self.lowest_price:.2f}")
+            
+            # Check jika harga menyentuh trailing stop
+            if current_price >= self.current_stop_loss:
+                logger.info(f"🎯 Trailing Stop Hit! Closing SHORT at ${current_price:.2f}")
+                await self.close_position("Trailing Stop Hit")
+    
+    async def orderflow_monitor_loop(self):
+        """
+        Loop utama untuk monitoring orderflow imbalance via REST API polling
+        """
+        logger.info("🚀 Starting Orderflow Monitor Loop...")
+        
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        log_counter = 0
+        
+        while True:
+            try:
+                # Fetch trades dari REST API (polling mode)
+                trades = self.exchange.fetch_trades(self.symbol, limit=100)
+                
+                # Tambahkan ke buffer (hindari duplikasi)
+                for trade in trades:
+                    trade_id = trade.get('id')
+                    existing_ids = [t.get('id') for t in self.trades_buffer]
+                    
+                    if trade_id not in existing_ids:
+                        self.trades_buffer.append(trade)
+                
+                # Reset error counter on success
+                consecutive_errors = 0
+                
+                # Kalkulasi imbalance hanya jika buffer sudah terisi cukup
+                if len(self.trades_buffer) < 50:
+                    await asyncio.sleep(2)
+                    continue
+                
+                imbalance = self.calculate_orderflow_imbalance()
+                
+                # Log status setiap 10 iterasi (throttle logging)
+                log_counter += 1
+                if log_counter % 10 == 0:
+                    logger.info(
+                        f"📊 Orderflow | Buffer: {len(self.trades_buffer)} | "
+                        f"V_Buy: {imbalance['v_buy']:.4f} | "
+                        f"V_Sell: {imbalance['v_sell']:.4f} | "
+                        f"Ratio B/S: {imbalance['ratio_buy']:.2f}"
+                    )
+                
+                # Ambil harga terakhir
+                if len(trades) > 0:
+                    current_price = trades[-1]['price']
+                else:
+                    await asyncio.sleep(2)
+                    continue
+                
+                # Signal Detection: LONG
+                if (imbalance['v_buy'] >= imbalance['v_sell'] * self.imbalance_threshold 
+                    and not self.position
+                    and imbalance['v_sell'] > 0):
+                    
+                    logger.info(f"🔥 LONG SIGNAL DETECTED! Imbalance Ratio: {imbalance['ratio_buy']:.2f}x")
+                    logger.info(f"📊 V_Buy: {imbalance['v_buy']:.4f} | V_Sell: {imbalance['v_sell']:.4f}")
+                    await self.open_long_position(current_price)
+                
+                # Signal Detection: SHORT
+                elif (imbalance['v_sell'] >= imbalance['v_buy'] * self.imbalance_threshold 
+                      and not self.position
+                      and imbalance['v_buy'] > 0):
+                    
+                    logger.info(f"🔥 SHORT SIGNAL DETECTED! Imbalance Ratio: {imbalance['ratio_sell']:.2f}x")
+                    logger.info(f"📊 V_Buy: {imbalance['v_buy']:.4f} | V_Sell: {imbalance['v_sell']:.4f}")
+                    await self.open_short_position(current_price)
+                
+                await asyncio.sleep(2)  # Polling interval 2 detik
+                
+            except (NetworkError, DDoSProtection, RateLimitExceeded) as e:
+                consecutive_errors += 1
+                logger.warning(f"⚠️ Network Error ({consecutive_errors}/{max_consecutive_errors}): {e}. Reconnecting in 5s...")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error("❌ Too many consecutive errors. Stopping orderflow loop.")
+                    break
+                
+                await asyncio.sleep(5)
+                continue
+                
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"❌ Unexpected error in orderflow loop ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                import traceback
+                traceback.print_exc()
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error("❌ Too many consecutive errors. Stopping orderflow loop.")
+                    break
+                
+                await asyncio.sleep(5)
+                continue
+    
+    async def trailing_stop_monitor_loop(self):
+        """
+        Loop independen untuk monitoring trailing stop via REST API
+        """
+        logger.info("🚀 Starting Trailing Stop Monitor Loop...")
+        
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
+        while True:
+            try:
+                if self.position:
+                    # Fetch ticker untuk harga real-time
+                    ticker = self.exchange.fetch_ticker(self.symbol)
+                    
+                    if 'last' in ticker:
+                        current_price = ticker['last']
+                    elif 'close' in ticker:
+                        current_price = ticker['close']
+                    else:
+                        await asyncio.sleep(2)
+                        continue
+                    
+                    # Update trailing stop
+                    await self.update_trailing_stop(current_price)
+                    
+                    # Kalkulasi PnL
+                    pnl_pct = 0
+                    pnl_usd = 0
+                    if self.position['side'] == 'long':
+                        pnl_pct = ((current_price - self.position['entry_price']) / self.position['entry_price']) * 100
+                        pnl_usd = (current_price - self.position['entry_price']) * self.position['amount']
+                    else:
+                        pnl_pct = ((self.position['entry_price'] - current_price) / self.position['entry_price']) * 100
+                        pnl_usd = (self.position['entry_price'] - current_price) * self.position['amount']
+                    
+                    logger.info(
+                        f"💼 Position: {self.position['side'].upper()} | "
+                        f"Entry: ${self.position['entry_price']:.2f} | "
+                        f"Current: ${current_price:.2f} | "
+                        f"PnL: {pnl_pct:+.2f}% (${pnl_usd:+.2f}) | "
+                        f"Stop: ${self.current_stop_loss:.2f}"
+                    )
+                    
+                    # Reset error counter
+                    consecutive_errors = 0
+                
+                await asyncio.sleep(2)  # Update setiap 2 detik
+                
+            except (NetworkError, DDoSProtection, RateLimitExceeded) as e:
+                consecutive_errors += 1
+                logger.warning(f"⚠️ Network Error in trailing loop ({consecutive_errors}/{max_consecutive_errors}): {e}. Reconnecting in 5s...")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error("❌ Too many consecutive errors. Stopping trailing loop.")
+                    break
+                
+                await asyncio.sleep(5)
+                continue
+                
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"❌ Unexpected error in trailing loop ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                import traceback
+                traceback.print_exc()
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error("❌ Too many consecutive errors. Stopping trailing loop.")
+                    break
+                
+                await asyncio.sleep(5)
+                continue
+    
+    async def run(self):
+        """
+        Jalankan bot dengan dual-loop architecture
+        """
+        try:
+            # Inisialisasi
+            await self.initialize()
+            
+            logger.info("=" * 60)
+            logger.info("🤖 BOT STARTED - Orderflow Imbalance Scalping")
+            logger.info("=" * 60)
+            logger.info(f"📈 Symbol: {self.symbol}")
+            logger.info(f"💰 Risk per Trade: ${self.risk_usd:.2f} (Rp {self.risk_idr:,.0f})")
+            logger.info(f"🎯 Imbalance Threshold: {self.imbalance_threshold}x")
+            logger.info(f"🛡️ Stop Loss: {self.stop_loss_pct*100}%")
+            logger.info(f"📊 Trailing Stop: {self.trailing_stop_pct*100}%")
+            logger.info("=" * 60)
+            
+            # Jalankan kedua loop secara paralel
+            await asyncio.gather(
+                self.orderflow_monitor_loop(),
+                self.trailing_stop_monitor_loop()
+            )
+            
+        except KeyboardInterrupt:
+            logger.info("🛑 Bot dihentikan oleh user")
+            
+            # Close posisi jika ada
+            if self.position:
+                await self.close_position("Bot Shutdown")
+            
+        except Exception as e:
+            logger.error(f"❌ Fatal error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Emergency close
+            if self.position:
+                try:
+                    await self.close_position("Emergency Shutdown")
+                except:
+                    pass
+            
+            raise
 
-# ==================== TAB 4: PROYEKSI & ANALISIS ====================
-with tab4:
-    st.markdown("<div class='section-header'>📊 PROYEKSI PROFITABILITAS JANGKA PANJANG</div>", unsafe_allow_html=True)
-    
-    # Hitung proyeksi per tahun
-    proyeksi_data = []
-    cumulative_profit = 0
-    bep_year = None
-    
-    for year in range(total_tahun + 1):
-        # CAPEX (hanya tahun 0)
-        capex = total_capex if year == 0 else 0
-        
-        # OPEX
-        if year <= durasi_tbm:
-            opex = total_opex_tbm_per_tahun if year > 0 else 0
-            produksi_ton = 0
-            pendapatan = 0
-        else:
-            # OPEX TM (fixed cost)
-            opex_fixed = 0
-            for idx in range(len(st.session_state.df_opex_tm)):
-                if st.session_state.df_opex_tm.loc[idx, 'Item'] not in ['Upah Panen (per Kg TBS)', 'Upah Langsir TBS', 'Transport ke PKS']:
-                    opex_fixed += st.session_state.df_opex_tm.loc[idx, 'Subtotal (Rp)']
-            
-            # Produksi
-            produksi_ton = get_yield_curve(year, luas_lahan)
-            produksi_kg = produksi_ton * 1000
-            
-            # OPEX variabel (tergantung produksi)
-            upah_panen = produksi_kg * st.session_state.df_opex_tm[st.session_state.df_opex_tm['Item'] == 'Upah Panen (per Kg TBS)']['Harga Satuan (Rp)'].values[0]
-            upah_langsir = produksi_ton * st.session_state.df_opex_tm[st.session_state.df_opex_tm['Item'] == 'Upah Langsir TBS']['Harga Satuan (Rp)'].values[0]
-            transport = produksi_ton * st.session_state.df_opex_tm[st.session_state.df_opex_tm['Item'] == 'Transport ke PKS']['Harga Satuan (Rp)'].values[0]
-            
-            opex = opex_fixed + upah_panen + upah_langsir + transport
-            pendapatan = produksi_kg * harga_tbs
-        
-        # Cash Flow
-        cash_flow = pendapatan - capex - opex
-        cumulative_profit += cash_flow
-        
-        # Deteksi BEP
-        if bep_year is None and cumulative_profit > 0 and year > 0:
-            bep_year = year
-        
-        proyeksi_data.append({
-            'Tahun': year,
-            'Fase': 'CAPEX' if year == 0 else ('TBM' if year <= durasi_tbm else 'TM'),
-            'CAPEX (Rp)': capex,
-            'OPEX (Rp)': opex,
-            'Produksi (Ton)': produksi_ton,
-            'Pendapatan (Rp)': pendapatan,
-            'Cash Flow (Rp)': cash_flow,
-            'Cumulative Profit (Rp)': cumulative_profit
-        })
-    
-    df_proyeksi = pd.DataFrame(proyeksi_data)
-    
-    # ==================== METRICS CARDS ====================
-    total_investasi = total_capex + total_opex_tbm_all
-    total_pendapatan = df_proyeksi['Pendapatan (Rp)'].sum()
-    total_profit = df_proyeksi['Cash Flow (Rp)'].sum()
-    avg_profit_per_bulan = total_profit / (total_tahun * 12) if total_tahun > 0 else 0
-    roi = (total_profit / total_investasi * 100) if total_investasi > 0 else 0
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.markdown(f"""
-        <div class='metric-card' style='background: linear-gradient(135deg, #d32f2f 0%, #f44336 100%);'>
-            <div class='metric-label'>💸 Total Investasi Awal</div>
-            <div class='metric-value'>{format_currency(total_investasi)}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown(f"""
-        <div class='metric-card' style='background: linear-gradient(135deg, #1976d2 0%, #2196F3 100%);'>
-            <div class='metric-label'>📅 Break Even Point</div>
-            <div class='metric-value'>Tahun {bep_year if bep_year else 'N/A'}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown(f"""
-        <div class='metric-card' style='background: linear-gradient(135deg, #388e3c 0%, #4CAF50 100%);'>
-            <div class='metric-label'>💰 Profit per Bulan (Avg)</div>
-            <div class='metric-value'>{format_currency(avg_profit_per_bulan)}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col4:
-        st.markdown(f"""
-        <div class='metric-card' style='background: linear-gradient(135deg, #f57c00 0%, #ff9800 100%);'>
-            <div class='metric-label'>📈 ROI ({total_tahun} Tahun)</div>
-            <div class='metric-value'>{roi:.1f}%</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("<br>", unsafe_allow_html=True)
-    
-    # ==================== GRAFIK INTERAKTIF ====================
-    fig = go.Figure()
-    
-    # Area background untuk fase TBM dan TM
-    fig.add_vrect(
-        x0=0, x1=durasi_tbm,
-        fillcolor="rgba(255, 152, 0, 0.1)",
-        layer="below", line_width=0,
-        annotation_text="Fase TBM", annotation_position="top left"
-    )
-    
-    fig.add_vrect(
-        x0=durasi_tbm, x1=total_tahun,
-        fillcolor="rgba(76, 175, 80, 0.1)",
-        layer="below", line_width=0,
-        annotation_text="Fase TM", annotation_position="top left"
-    )
-    
-    # Line Chart: Cash Flow Tahunan
-    fig.add_trace(go.Scatter(
-        x=df_proyeksi['Tahun'],
-        y=df_proyeksi['Cash Flow (Rp)'],
-        mode='lines+markers',
-        name='Cash Flow Tahunan',
-        line=dict(color='#2196F3', width=3),
-        marker=dict(size=6),
-        hovertemplate='Tahun %{x}<br>Cash Flow: Rp %{y:,.0f}<extra></extra>'
-    ))
-    
-    # Line Chart: Cumulative Profit
-    fig.add_trace(go.Scatter(
-        x=df_proyeksi['Tahun'],
-        y=df_proyeksi['Cumulative Profit (Rp)'],
-        mode='lines+markers',
-        name='Akumulasi Laba',
-        line=dict(color='#4CAF50', width=4),
-        marker=dict(size=8),
-        fill='tozeroy',
-        fillcolor='rgba(76, 175, 80, 0.2)',
-        hovertemplate='Tahun %{x}<br>Akumulasi: Rp %{y:,.0f}<extra></extra>'
-    ))
-    
-    # Garis BEP
-    if bep_year:
-        fig.add_vline(
-            x=bep_year, 
-            line_dash="dash", 
-            line_color="red", 
-            line_width=2,
-            annotation_text=f"BEP: Tahun {bep_year}",
-            annotation_position="top"
-        )
-    
-    # Garis nol
-    fig.add_hline(y=0, line_dash="dot", line_color="white", line_width=1)
-    
-    fig.update_layout(
-        title={
-            'text': '📈 Proyeksi Profitabilitas Jangka Panjang (25 Tahun)',
-            'x': 0.5,
-            'xanchor': 'center',
-            'font': {'size': 20, 'color': '#4CAF50'}
-        },
-        xaxis_title='Tahun',
-        yaxis_title='Rupiah (Rp)',
-        hovermode='x unified',
-        template='plotly_dark',
-        height=600,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        )
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # ==================== TABEL PROYEKSI ====================
-    st.markdown("<div class='section-header'>📋 Detail Proyeksi Per Tahun</div>", unsafe_allow_html=True)
-    
-    # Format tabel untuk display
-    df_display = df_proyeksi.copy()
-    for col in ['CAPEX (Rp)', 'OPEX (Rp)', 'Pendapatan (Rp)', 'Cash Flow (Rp)', 'Cumulative Profit (Rp)']:
-        df_display[col] = df_display[col].apply(lambda x: format_currency(x))
-    df_display['Produksi (Ton)'] = df_display['Produksi (Ton)'].apply(lambda x: f"{x:.2f}")
-    
-    st.dataframe(df_display, use_container_width=True, height=400)
-    
-    # ==================== EXPORT FEATURE ====================
-    st.markdown("<div class='section-header'>💾 Export Data</div>", unsafe_allow_html=True)
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        # Export CAPEX
-        buffer_capex = BytesIO()
-        with pd.ExcelWriter(buffer_capex, engine='openpyxl') as writer:
-            st.session_state.df_capex.to_excel(writer, index=False, sheet_name='CAPEX')
-        
-        st.download_button(
-            label="📥 Download CAPEX (Excel)",
-            data=buffer_capex.getvalue(),
-            file_name=f"RAB_CAPEX_{luas_lahan}Ha.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    
-    with col2:
-        # Export OPEX
-        buffer_opex = BytesIO()
-        with pd.ExcelWriter(buffer_opex, engine='openpyxl') as writer:
-            st.session_state.df_opex_tbm.to_excel(writer, index=False, sheet_name='OPEX TBM')
-            st.session_state.df_opex_tm.to_excel(writer, index=False, sheet_name='OPEX TM')
-        
-        st.download_button(
-            label="📥 Download OPEX (Excel)",
-            data=buffer_opex.getvalue(),
-            file_name=f"RAB_OPEX_{luas_lahan}Ha.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    
-    with col3:
-        # Export Proyeksi
-        buffer_proyeksi = BytesIO()
-        with pd.ExcelWriter(buffer_proyeksi, engine='openpyxl') as writer:
-            df_proyeksi.to_excel(writer, index=False, sheet_name='Proyeksi 25 Tahun')
-        
-        st.download_button(
-            label="📥 Download Proyeksi (Excel)",
-            data=buffer_proyeksi.getvalue(),
-            file_name=f"Proyeksi_Profitabilitas_{luas_lahan}Ha.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
 
-# ==================== FOOTER ====================
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #666; padding: 20px;'>
-    <p>🌴 <strong>Sistem RAB Dinamis Kelapa Sawit</strong> | Developed by Senior Full-stack Developer & Agribusiness Consultant</p>
-    <p>📊 Data Pasar: <strong>April 2026</strong> | Urea: Rp 11.000/kg | NPK: Rp 14.500/kg | Upah Panen: Rp 300/kg</p>
-    <p style='font-size: 12px; margin-top: 10px;'>⚠️ Disclaimer: Proyeksi ini bersifat estimasi berdasarkan data pasar terkini dan kurva produksi standar industri. Hasil aktual dapat bervariasi tergantung kondisi lapangan.</p>
-</div>
-""", unsafe_allow_html=True)
+async def main():
+    """
+    Entry point utama
+    """
+    # ============================================
+    # KONFIGURASI - GANTI DENGAN API KEY ANDA
+    # ============================================
+    # Dapatkan API Key dari: https://testnet.binancefuture.com/
+    API_KEY = 'oYqfkBgsAxKTgFP3rR3h8bGnqsN2mxUC1PcCY4B7d6dIMbeGIxXM26yaXb09PtfY'
+    API_SECRET = 'VZYyWmIqPXT5f4F56X2DAHCyzgse1lHB5hG44tkyXzCl7XN3xP59c5vVVJlaRBTk'
+    SYMBOL = 'BTC/USDT:USDT'  # Trading pair
+    
+    # Inisialisasi bot
+    bot = OrderflowScalpingBot(
+        api_key=API_KEY,
+        api_secret=API_SECRET,
+        symbol=SYMBOL,
+        demo_mode=True  # Set False untuk live trading
+    )
+    
+    # Jalankan bot
+    await bot.run()
+
+
+if __name__ == "__main__":
+    """
+    Eksekusi bot
+    """
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 Bot terminated gracefully")
+    except Exception as e:
+        logger.error(f"💥 Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
